@@ -1,0 +1,1 @@
+"""OriginCar competition automation package."""

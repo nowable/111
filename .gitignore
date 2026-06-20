@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 本地源码备份
+*.bak
+
+# 编辑器/工具本地状态
+.claude/
+.vscode/
+.idea/
+
+# ROS2 编译产物（板子上 colcon build 会生成，不进库）
+build/
+install/
+log/
+
+# 大数据集 / 模型权重（体积大或唯一副本，单独传，别进 git）
+field_captures/
+bpu_quant/cal_images/
+*.onnx
+
+# 任何密钥 / 密码文件（保险起见，绝不入库）
+*.key
+.dashscope_key
+*secret*
+*password*

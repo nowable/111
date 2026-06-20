@@ -1,0 +1,223 @@
+// ============================================================================
+//  mission_defaults.annotated.jsonc  —  逐行注释参考版(只读,勿用于运行)
+// ----------------------------------------------------------------------------
+//  ⚠ 标准 json.load 不支持注释。本文件后缀 .jsonc,不会被 glob('config/*.json')
+//    安装、也不会被任何工具加载。运行请始终用同目录的 mission_defaults.json。
+//  ⚠ 改参数请改 mission_defaults.json,改完同步过来这里的数值即可。
+//  约定:速度单位 m/s,角速度 rad/s,时间 s,*_ratio 为占画面比例(0~1)。
+// ============================================================================
+{
+  // ---- 话题与目录 ----
+  "cmd_vel_topic": "/cmd_vel",                  // 速度指令出口(底盘订阅)
+  "image_topic": "/image",                      // 相机图像输入
+  "voltage_topic": "/PowerVoltage",             // 电池电压(预检读它判断够不够电)
+  "state_topic": "/competition/state",          // 状态机事件广播(JSON 字符串)
+  "debug_dir": "/root/dev_ws/debug/competition",// 截图/调试产物落盘目录
+
+  // ---- 节奏与全局速度钳制 ----
+  "rate_hz": 10.0,                              // 主循环频率
+  "stop_repeat": 5,                             // 每次停车重发几帧零速(保证刹停)
+  "max_linear": 0.08,                           // 线速度硬上限(所有阶段不得超)
+  "max_angular": 0.5,                           // 角速度硬上限
+
+  // ---- 各阶段巡航/转向基速 ----
+  "cruise_linear": 0.03,                        // A 区大厅前进基速
+  "turn_angular": 0.2,                          // 决策转向角速度
+  "ackermann_turn_mode": "arc",                // 定角转向模式：arc=低速前进转弯（默认）；shunt 已废除 2026-06-11（45s 仅 128.7°），勿改回
+  "shunt_forward_linear": 0.06,                 // shunt 前进揉方向速度，需高于底盘静摩擦/死区
+  "shunt_reverse_linear": 0.06,                 // shunt 后退揉方向速度幅值，需高于底盘静摩擦/死区
+  "shunt_pulse_s": 1.0,                         // 每次前进/后退揉方向持续时间
+  "shunt_stop_s": 0.20,                         // shunt 前后动作之间停顿时间
+  "shunt_turn_timeout": 45.0,                   // 单次 shunt 定角转向超时
+  "steering_turn_linear": 0.03,                 // 阿克曼底盘转向时保留的低速前进速度
+  "loop_linear": 0.03,                          // C 区环线前进基速
+  "loop_angular": 0.2,                          // C 区环线转向角速度
+
+  // ---- 内置地图 2D 航点路线(优先使用) ----
+  "route_mode": "map2d",                        // map2d=内置地图航点 | fixed2d=下方段式路线 | legacy=旧视觉触发
+  "map_route_enabled": true,                    // 是否启用内置地图航点追踪
+  "map_start_pose": {"x": 0.284, "y": 0.298, "heading_deg": 3.1}, // P点车头沿红线/黑虚线第一段摆放
+  "map_waypoint_tol": 0.08,                     // 航点到达容差(m)
+  "map_heading_kp": 1.0,                        // 航点追踪航向比例
+  "map_max_linear": 0.03,                       // 普通地图路线线速度(A/QR/B/返航)
+  "map_loop_linear": 0.05,                      // C 区环线地图路线线速度
+  "map_loop_turn_linear": 0.04,                 // C 区环线大角度修正时最低线速度
+  "map_max_angular": 0.25,                      // 地图路线最大角速度
+  "map_route_timeout": 160.0,                   // 单条地图路线兜底超时
+  "map_start_heading_guard_enabled": true,      // A区起步航向偏差过大时停车,防止按错路线撞墙
+  "map_start_heading_guard_rad": 0.35,          // 起步最大允许航向偏差(rad),0.35约20度
+  "map_detour_enabled": true,                   // 中心危险障碍触发轻量绕行
+  "map_detour_turn_s": 0.8,                     // 绕行外摆转向时间
+  "map_detour_drive_s": 0.9,                    // 绕行前进时间
+  "map_detour_recover_s": 0.8,                  // 绕行回正转向时间
+  "map_detour_cooldown_s": 1.0,                 // 绕行触发冷却,避免连续抖动
+
+  // ---- 固定 2D 路线(备用回退) ----
+  "fixed_route_enabled": true,                  // 是否启用固定路线
+  "fixed_route_linear": 0.03,                   // 固定路线直行/弧线线速度
+  "fixed_route_turn_linear": 0.03,              // fixed2d turn 段低速前进速度；前轮转向底盘不能原地转
+  "fixed_route_turn_angular": 0.4,              // 固定路线转向/弧线角速度
+  "fixed_route_heading_tol": 0.10,              // 固定转角允许误差(rad)
+  "fixed_route_dist_tol": 0.05,                 // 固定距离允许误差(m)
+  "fixed_route_segment_timeout": 30.0,          // 单个 route 段兜底超时；前轮转向车大角度转弯需要更长
+  "fixed_routes": {                             // 现场只改这里的 distance / angle_deg
+    "A_TO_QR": [                                // P 点车头沿黑色虚线向右上摆放,再接近二维码
+      {"type": "drive", "distance": 0.37},
+      {"type": "drive", "distance": 0.597},
+      {"type": "turn", "angle_deg": 5.8},
+      {"type": "drive", "distance": 0.546},
+      {"type": "drive", "distance": 0.551},
+      {"type": "turn", "angle_deg": 4.7},
+      {"type": "drive", "distance": 0.563},
+      {"type": "turn", "angle_deg": 4.1},
+      {"type": "drive", "distance": 0.529},
+      {"type": "turn", "angle_deg": 6.1},
+      {"type": "drive", "distance": 0.496},
+      {"type": "drive", "distance": 0.424},
+      {"type": "turn", "angle_deg": 12.5},
+      {"type": "drive", "distance": 0.344},
+      {"type": "drive", "distance": 0.273},
+      {"type": "turn", "angle_deg": -15.7},
+      {"type": "seek_qr", "max_distance": 0.225}
+    ],
+    "QR_TO_CORRIDOR": [                         // 二维码处回到中间黄色通道入口
+      {"type": "turn", "angle_deg": 140.5},
+      {"type": "drive", "distance": 0.888},
+      {"type": "turn", "angle_deg": 7.3},
+      {"type": "drive", "distance": 1.053},
+      {"type": "turn", "angle_deg": -34.3},
+      {"type": "drive", "distance": 0.256}
+    ],
+    "B_CORRIDOR": [                             // B 区 0.5m 横向区域内的中间通道
+      {"type": "turn", "angle_deg": -51.3},
+      {"type": "drive", "distance": 0.58}
+    ],
+    "C_LOOP_RIGHT": [
+      {"type": "arc", "angle_deg": -330, "radius_hint": 0.7}
+    ],
+    "C_LOOP_LEFT": [
+      {"type": "arc", "angle_deg": 330, "radius_hint": 0.7}
+    ]
+  },
+
+  // ---- 黄线循迹(PD 控制) ----
+  "lane_follow_enabled": true,                  // 是否启用黄线循迹
+  "lane_roi_y_ratio": 0.6,                      // ROI 起始纵向位置(画面上方占比)
+  "lane_roi_height_ratio": 0.35,               // ROI 高度占比
+  "lane_kp": 0.6,                               // 循迹比例增益(越大转向越猛)
+  "lane_kd": 0.1,                               // 循迹微分增益(抑制震荡)
+  "lane_base_linear": 0.03,                     // 循迹时前进基速
+  "lane_min_mask_area_ratio": 0.01,            // 黄色掩膜最小面积,低于则判定丢线
+  "lane_lost_behavior": "creep",               // 丢线行为:creep=慢速直行找线 | stop=停
+
+  // ---- C 区环线 / B 区走廊 ----
+  "ring_bias": 0.25,                            // 环线贴边偏置(>0 贴外,绕中央禁区用)
+  "corridor_length_m": 2.0,                     // B 区走廊预估长度(odom 走够即退出)
+  "green_exit_ratio": 0.15,                     // 绿色禁区占比超此值,判定到达环线入口
+  "loop_complete_fraction": 0.92,              // 累计偏航占 360° 的比例,达到判一圈完成
+  "loop_timeout": 40.0,                         // 绕环兜底超时(IMU 漂移时强制退出)
+  "corridor_timeout": 30.0,                     // B 区走廊兜底超时
+  "corridor_require_green_exit": false,        // 是否必须见绿才退走廊(false=fail-soft,见不到也进环)
+  "transition_settle_s": 0.3,                   // 分区切换间的短暂停顿(A→B、B→C)
+
+  // ---- 沿途橙牌采集 ----
+  "marker_capture_min_area": 0.02,             // 橙色图文牌最小占比,达到才抓拍
+  "target_marker_policy": "directional_one",  // directional_one=只识别二维码方向对应的一个图文牌
+  "marker_capture_window_m": 0.35,             // 进入目标图文牌地图点此半径内才允许抓拍
+
+  // ---- 返航(第二黑虚线地图返航 + 轨迹兜底) ----
+  "return_linear": -0.03,                       // timed 回退模式的倒车速度
+  "return_mode": "map2d_fallback",             // map2d_fallback=地图返航失败再轨迹重放
+  "map_return_route_enabled": true,            // 是否优先走 RETURN_TO_P 地图路线
+  "map_return_timeout": 90.0,                  // RETURN_TO_P 地图返航超时
+  "return_waypoint_stride": 3,                  // 轨迹降采样步长(每隔几个点取一段)
+  "return_min_segment_dist": 0.05,             // 单段最小距离,过短的段合并掉
+  "return_drive_linear": 0.04,                  // 返航每段直行速度
+  "return_turn_linear": 0.03,                   // 轨迹返航转向对齐时低速前进速度
+  "return_turn_angular": 0.4,                   // 返航每段转向角速度
+  "return_heading_tol": 0.10,                   // 转向到位容差(rad,yaw 闭环)
+  "return_dist_tol": 0.05,                       // 直行到位容差(m,odom 闭环)
+  "return_segment_timeout": 30.0,              // 单段执行超时；前轮转向车转向对齐较慢
+  "return_total_timeout": 60.0,                 // 整个返航总超时
+  "return_angular": 0.0,                        // timed 回退模式的转向角速度
+
+  // ---- 预检与各阶段超时 ----
+  "preflight_timeout": 5.0,                     // 预检每项(订阅者/图像/电压/odom)等待上限
+  "drive_to_qr_timeout": 20.0,                  // 驶向二维码阶段超时
+  "drive_to_qr_max_distance": 2.5,             // 找二维码最多前进多远(m)
+  "qr_min_area_ratio": 0.01,                    // 二维码最小占比,达到才尝试解码
+  "qr_center_band": 0.4,                        // 二维码居中带宽(占比,在带内才算对准)
+  "qr_seek_after_s": 4.0,                        // 找不到二维码多久后开始原地搜寻
+  "qr_seek_angular": 0.15,                       // 搜寻二维码时的旋转角速度
+  "qr_align_after_scan_enabled": true,           // 扫到 QR 并判定方向后，先原地(arc)转向对齐到水平向左(shunt 已废弃)
+  "qr_exit_heading_deg": 180.0,                  // QR 后离开方向：地图水平向左为 180 度
+  "qr_align_heading_tol": 0.10,                  // QR 后对齐容差(rad)
+  "qr_confirm_count": 3,                          // 防跳变:需连续几帧解出同一方向才锁定,锁后永不变(规则:不可跳变)
+  "scan_qr_timeout": 8.0,                        // 解码二维码阶段超时
+
+  // ---- 占位时长(dry-run / placeholder 模式用,实跑不依赖) ----
+  "loop_duration": 2.0,                          // 占位:绕环假定耗时
+  "capture_timeout": 3.0,                        // 抓拍目标图像超时
+  "return_duration": 1.0,                        // 占位:返航假定耗时
+  "max_runtime": 175.0,                          // 整局任务硬超时(到点强制 STOP);规则 180s 完赛,留 5s 余量停稳
+  "image_stale_timeout": 3.0,                   // 图像超过此秒数没更新即判定为陈旧
+
+  // ---- 板载 YOLOv8 检测(可选,叠加在 HSV 之上) ----
+  "use_yolo_detections": true,                  // 是否吃板载 DNN 检测结果
+  "yolo_topic": "/hobot_dnn_detection",         // YOLO 检测话题
+  "yolo_stale_timeout": 1.0,                     // YOLO 结果陈旧阈值
+  "yolo_min_confidence": 0.45,                  // YOLO 置信度门槛,低于忽略
+
+  // ---- 进程内 YOLO11n(yolo_detector.py,6-11 接入主线避障) ----
+  "yolo_local_model": "",                        // 模型路径:板上 .bin / 本地 .onnx;空字符串=禁用(纯 HSV)。板上应指向 /root/dev_ws/models/ 下的 bin
+  "yolo_local_conf": 0.50,                       // 进程内 YOLO 置信度门槛;现场误检多就上调
+  "yolo_replaces_hsv_obstacle": true,            // 模型健康时跳过 HSV 障碍掩膜(YOLO 为主);模型挂了自动回 HSV
+  "yolo_local_min_interval": 0.12,               // 两次推理最小间隔(秒),期间复用缓存结果
+
+  // ---- 避障(深蓝障碍物) ----
+  "obstacle_avoid_enabled": true,               // 是否启用避障
+  "obstacle_turn_linear": 0.03,                 // 避障转向时低速前进速度
+  "obstacle_turn_angular": 0.18,                // 避障转向角速度
+  "obstacle_roi_y_ratio": 0.45,                 // 避障 ROI 起始纵向占比
+  "obstacle_min_area_ratio": 0.015,            // 障碍最小占比,达到才反应
+  "obstacle_danger_area_ratio": 0.035,         // 障碍危险占比,超过则强力规避
+  "obstacle_center_band_ratio": 0.36,          // 正前方危险带宽(占比)
+
+  // ---- 黑色阈值(给二维码/深色定位用,V 越低越黑) ----
+  "black_v_max": 85,                            // 黑色明度上限
+  "black_s_min": 20,                            // 黑色饱和度下限
+
+  // ---- 颜色角色映射(把语义角色绑到下面 color_profiles 里的某个具名颜色) ----
+  "obstacle_color": "dark_blue",                // 障碍物用哪个颜色
+  "lane_color": "yellow",                       // 车道线用哪个颜色
+  "marker_color": "orange",                     // 沿途图文牌用哪个颜色
+  "green_color": "green",                        // 禁区用哪个颜色
+  "require_triangle": false,                     // 是否要求障碍呈三角形(false=只按颜色)
+
+  // ---- HSV 阈值表(OpenCV H:0~179, S/V:0~255;场地日主要调这里) ----
+  "color_profiles": {
+    "dark_blue": {"h_min": 100, "h_max": 130, "s_min": 80,  "s_max": 255, "v_min": 40,  "v_max": 255},  // 深蓝障碍
+    "yellow":    {"h_min": 20,  "h_max": 35,  "s_min": 80,  "s_max": 255, "v_min": 80,  "v_max": 255},  // 黄色车道
+    "orange":    {"h_min": 8,   "h_max": 20,  "s_min": 110, "s_max": 255, "v_min": 120, "v_max": 255},  // 橙色图文牌
+    "green":     {"h_min": 40,  "h_max": 85,  "s_min": 40,  "s_max": 255, "v_min": 60,  "v_max": 255},  // 绿色禁区
+    "black":     {"h_min": 0,   "h_max": 179, "s_min": 20,  "s_max": 255, "v_min": 0,   "v_max": 85}    // 黑色
+  },
+
+  // ---- 目标卡片裁剪(送 LLM 前把白底卡片抠出来) ----
+  "target_crop_enabled": true,                  // 是否启用目标裁剪
+  "target_min_area_ratio": 0.025,              // 目标卡片最小占比
+  "target_white_s_max": 90,                     // 白底饱和度上限(越小越"白")
+  "target_white_v_min": 150,                    // 白底明度下限(越大越亮)
+
+  // ---- 多模态 LLM(阿里百炼 DashScope,OpenAI 兼容接口) ----
+  "llm_mode": "placeholder",                    // 模式:placeholder=不真发请求(安全默认) | openai-compatible=真调用 | disabled=关
+  "llm_api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",  // DashScope 兼容端点
+  "llm_model": "qwen-vl-plus",                  // 视觉模型(qwen-vl-max-latest 该 key 无权限会 403)
+  "llm_api_key_env": "DASHSCOPE_API_KEY",       // 从哪个环境变量读 key(运行前 export)
+  "llm_timeout": 20.0,                          // 请求超时
+  "llm_prompt": "你是医院巡检机器人。请用中文简短描述图中卡片上的主要物体或符号(例如药品、器械、警示标志),并指出你的判断置信度。若图像模糊请说明。",  // 发给模型的提示词
+  "llm_max_image_dim": 1024,                    // 上传前最长边缩到此像素(省流量防超时)
+  "llm_jpeg_quality": 85,                       // 缩放后重编码 JPEG 质量
+  "llm_downscale_enabled": true,                // 是否启用上传前缩放
+  "llm_result_topic": "/competition/llm_result" // LLM 识别结果发布话题
+}
