@@ -298,6 +298,7 @@ class MissionConfig:
     return_line_lost_grace_frames: int = 5
     preflight_timeout: float = 5.0
     drive_to_qr_timeout: float = 20.0
+    drive_qr_area_threshold: float = 0.026
     drive_to_qr_max_distance: float = 2.5
     # Inchworm approach to the QR board: scan a clean STATIONARY frame, and only
     # if no QR decodes, creep forward one short chunk before scanning again.
@@ -1321,6 +1322,7 @@ class AutoMissionNode(Node):
         lane_lost_frames = 0
         _recover_log_t: float = 0.0
         _sweep_start: Optional[float] = None
+        _qr_check_skip = 0
         print(
             'DRIVE_TO_QR: black-line follow, obstacle avoid, '
             f'max_distance={self.config.drive_to_qr_max_distance:.2f}m '
@@ -1335,6 +1337,11 @@ class AutoMissionNode(Node):
             if image is None:
                 self._spin_sleep(interval)
                 continue
+            _qr_check_skip += 1
+            if _qr_check_skip % 15 == 0 and _pyzbar is not None:
+                result = self._drive_check_qr_area(image)
+                if result is not None:
+                    return result
             decision = self._analyze_frame(image)
             if decision.obstacle_danger and self.config.obstacle_avoid_enabled:
                 self._handle_drive_obstacle(image, decision, interval)
@@ -1444,6 +1451,23 @@ class AutoMissionNode(Node):
         self._last_avoid_time = time.monotonic()
         self.motion.publish(linear, turn)
         self._spin_sleep(interval)
+
+    def _drive_check_qr_area(self, image: np.ndarray) -> Optional[str]:
+        """Fast pyzbar-only QR check during drive; returns SCAN_QR if area >= threshold."""
+        h, w = image.shape[:2]
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        barcodes = _pyzbar.decode(gray)
+        for b in barcodes:
+            x, y, bw, bh = b.rect
+            area_ratio = (bw * bh) / (w * h)
+            if area_ratio >= self.config.drive_qr_area_threshold:
+                self.qr_content = b.data.decode()
+                self.qr_method = 'pyzbar_drive'
+                print(f'QR_DRIVE_AREA_OK text={self.qr_content} area={area_ratio:.4f}', flush=True)
+                self._event('qr_drive_area_ok', content=self.qr_content, area=round(area_ratio, 4))
+                self._stop_with_spin()
+                return 'SCAN_QR'
+        return None
 
     def _drive_probe_qr(self, image, elapsed: float) -> Optional[str]:
         """Probe for the QR board; steer toward it and stop when readable.
@@ -1776,7 +1800,7 @@ class AutoMissionNode(Node):
                     print('BRIDGE_QR: turn right 90deg into corridor', flush=True)
                     self._event('bridge_qr_turn_right')
                     self._rotate_relative_arc(
-                        -math.radians(90),
+                        -math.radians(60),
                         math.radians(5),
                         self.config.shunt_turn_timeout,
                     )

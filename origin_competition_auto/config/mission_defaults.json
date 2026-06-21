@@ -216,6 +216,7 @@
   "preflight_timeout": 5.0,
   "drive_to_qr_timeout": 60.0,
   "drive_to_qr_max_distance": 15.0,
+  "drive_qr_area_threshold": 0.026,
   "qr_min_area_ratio": 0.01,
   "qr_center_band": 0.4,
   "qr_seek_after_s": 4.0,
