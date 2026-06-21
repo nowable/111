@@ -195,7 +195,7 @@ class MissionConfig:
     debug_dir: str = '/root/dev_ws/debug/competition'
     rate_hz: float = 10.0
     stop_repeat: int = 5
-    max_linear: float = 0.08
+    max_linear: float = 0.35
     max_angular: float = 0.58
     cruise_linear: float = 0.03
     turn_angular: float = 0.2
@@ -232,7 +232,7 @@ class MissionConfig:
     map_detour_recover_s: float = 0.8
     map_detour_cooldown_s: float = 1.0
     fixed_route_enabled: bool = True
-    fixed_route_linear: float = 0.03
+    fixed_route_linear: float = 0.3
     fixed_route_turn_linear: float = 0.03
     fixed_route_turn_angular: float = 0.5
     fixed_route_heading_tol: float = 0.10
@@ -287,6 +287,15 @@ class MissionConfig:
     return_dist_tol: float = 0.05        # m; stop driving within this
     return_segment_timeout: float = 30.0
     return_total_timeout: float = 60.0
+    return_reacquire_enabled: bool = True
+    return_reacquire_turn_deg: float = 90.0
+    return_reacquire_forward_s: float = 0.8
+    return_reacquire_turn2_deg: float = 42.0
+    return_reacquire_forward2_s: float = 1.0
+    return_reacquire_search_timeout: float = 6.0
+    return_reacquire_linear: float = 0.05
+    return_reacquire_angular: float = 0.22
+    return_line_lost_grace_frames: int = 5
     preflight_timeout: float = 5.0
     drive_to_qr_timeout: float = 20.0
     drive_to_qr_max_distance: float = 2.5
@@ -302,7 +311,7 @@ class MissionConfig:
     # crawling straight at cruise_linear (0.04 m/s) which looks like the car has
     # stalled and never re-finds the line/QR (field 6-17: 避障扭头后看不见线/码
     # 就极慢直行). 0 angular falls back to a straight nudge at drive_lost_linear.
-    drive_lost_linear: float = 0.12
+    drive_lost_linear: float = 0.3
     drive_lost_angular: float = 0.30
     recover_after_avoid_s: float = 3.0
     recover_sweep_max_s: float = 1.5
@@ -351,7 +360,7 @@ class MissionConfig:
     # (zone left/right). At the low obstacle_turn_linear the Ackermann car only
     # pivots beside a side cone and stays stuck on it (field 6-17); a faster
     # forward push translates the car past it so it leaves the frame.
-    obstacle_pass_linear: float = 0.22
+    obstacle_pass_linear: float = 0.3
     obstacle_roi_y_ratio: float = 0.45
     obstacle_min_area_ratio: float = 0.015
     obstacle_danger_area_ratio: float = 0.035
@@ -408,6 +417,14 @@ class MissionConfig:
     bridge_black_reentry_turn_angular: float = 0.5
     bridge_black_reentry_turn_linear: float = 0.08
     bridge_black_reentry_forward_s: float = 1.2
+    bridge_entry_reference_enabled: bool = True
+    bridge_entry_reference_image: str = '/root/dev_ws/debug/competition/return_gate_snapshot.jpg'
+    bridge_entry_reference_min_score: float = 0.55
+    bridge_entry_reference_timeout: float = 4.0
+    bridge_entry_reference_roi_x_ratio: float = 0.25
+    bridge_entry_reference_roi_y_ratio: float = 0.12
+    bridge_entry_reference_roi_w_ratio: float = 0.50
+    bridge_entry_reference_roi_h_ratio: float = 0.45
     bridge_search_dir: str = 'left'
     bridge_target_roi_y_ratio: float = 0.18
     bridge_target_min_area_ratio: float = 0.015
@@ -425,14 +442,14 @@ class MissionConfig:
     # 停会几乎不倒就退出→forward bridge 朝牌前进撞码(field 6-17)。改为按 odom 里程
     # 后退固定距离 bridge_backup_distance_m，退到任务发布区后方、能看见通道口为止。
     bridge_backup_enabled: bool = True
-    bridge_backup_linear: float = -0.08    # 倒车速度(负=后退；幅值受 max_linear 钳)
+    bridge_backup_linear: float = -0.3    # 倒车速度(负=后退；幅值受 max_linear 钳)
     bridge_backup_distance_m: float = 0.35  # 后退固定距离(odom 里程判停；现场调)
     # 倒车时同时给角速度→阿克曼边退边转头,把车头从"对着码牌/右侧网格"摆向中间通道。
     # 符号:>0=车头左转(CCW)。码牌在右、通道在中,默认左转朝中间;转反了翻符号即可。
     bridge_backup_angular: float = 0.30
     bridge_backup_max_s: float = 6.0       # 倒车时间上限(安全帽；无 odom 时按此纯计时后退)
     bridge_post_backup_forward_s: float = 4.0
-    bridge_post_backup_linear: float = 0.20
+    bridge_post_backup_linear: float = 0.30
     bridge_post_backup_angular: float = 0.0
 
     @classmethod
@@ -1029,6 +1046,9 @@ class AutoMissionNode(Node):
         self.local_yolo = None
         self._local_yolo_cache: List[Detection] = []
         self._local_yolo_cache_time = 0.0
+        self._bridge_entry_reference_mask: Optional[np.ndarray] = None
+        self._bridge_entry_reference_ready = False
+        self._load_bridge_entry_reference()
         if config.yolo_local_model:
             try:
                 from .yolo_detector import YoloDetector
@@ -1172,6 +1192,28 @@ class AutoMissionNode(Node):
             flush=True,
         )
 
+    def _load_bridge_entry_reference(self) -> None:
+        if not self.config.bridge_entry_reference_enabled:
+            return
+        path = str(self.config.bridge_entry_reference_image or '').strip()
+        if not path:
+            return
+        image = cv2.imread(path)
+        if image is None:
+            print(f'BRIDGE_ENTRY_REFERENCE_LOAD_FAIL path={path}', flush=True)
+            return
+        mask = self._bridge_entry_reference_mask_for_image(image)
+        if mask is None or float(mask.mean()) <= 1e-6:
+            print(f'BRIDGE_ENTRY_REFERENCE_EMPTY path={path}', flush=True)
+            return
+        self._bridge_entry_reference_mask = mask
+        self._bridge_entry_reference_ready = True
+        print(
+            'BRIDGE_ENTRY_REFERENCE_LOADED '
+            f'path={path} green_ratio={float(mask.mean()):.3f}',
+            flush=True,
+        )
+
     def _run_state(self, state: str) -> str:
         handlers: Dict[str, Callable[[], str]] = {
             'IDLE': self._state_idle,
@@ -1261,117 +1303,94 @@ class AutoMissionNode(Node):
         if self._fixed_route_ready():
             result = self._execute_fixed_route('A_TO_QR', allow_qr=True)
             return result or 'SCAN_QR'
-        deadline = time.monotonic() + self.config.drive_to_qr_timeout
+        follower = LaneFollower(
+            self.vision_detector, 'black',
+            self.config.lane_follow_config(bias=0.0, side_mode='center'))
+        follower.reset()
+        search_follower = LaneFollower(
+            self.vision_detector, 'black',
+            self.config.lane_follow_config(
+                bias=0.0, side_mode='center',
+                roi_y_ratio=self.config.drive_recover_search_roi,
+                roi_height_ratio=1.0 - self.config.drive_recover_search_roi))
+        search_follower.reset()
         interval = 1.0 / self.config.rate_hz
+        deadline = time.monotonic() + self.config.drive_to_qr_timeout
+        self._last_avoid_turn = 0.0
+        self._last_avoid_time = 0.0
+        lane_lost_frames = 0
+        _recover_log_t: float = 0.0
+        _sweep_start: Optional[float] = None
         print(
-            'DRIVE_TO_QR: drive-then-scan '
-            f'(chunk={self.config.drive_chunk_s:.1f}s settle={self.config.drive_scan_settle_s:.1f}s), '
-            f'dark-blue obstacle avoidance, '
+            'DRIVE_TO_QR: black-line follow, obstacle avoid, '
             f'max_distance={self.config.drive_to_qr_max_distance:.2f}m '
             f'timeout={self.config.drive_to_qr_timeout:.1f}s',
             flush=True,
         )
-        hall_follower = None
-        search_follower = None
-        if self.config.hall_line_follow_enabled:
-            hall_follower = LaneFollower(
-                self.vision_detector, 'black',
-                self.config.lane_follow_config(bias=0.0, side_mode='center'))
-            hall_follower.reset()
-            search_follower = LaneFollower(
-                self.vision_detector, 'black',
-                self.config.lane_follow_config(
-                    bias=0.0, side_mode='center',
-                    roi_y_ratio=self.config.drive_recover_search_roi,
-                    roi_height_ratio=1.0 - self.config.drive_recover_search_roi))
-            search_follower.reset()
-            print('DRIVE_TO_QR: hall black-dashed-line following enabled', flush=True)
-        self._last_avoid_turn = 0.0
-        self._last_avoid_time = 0.0
-        _recover_log_t: float = 0.0           # throttle DRIVE_TO_QR_RELINE prints
-        _sweep_start: Optional[float] = None  # continuous sweep timer (recover_sweep_max_s)
         while time.monotonic() < deadline and rclpy.ok():
             if not self.guard.runtime_ok():
                 self.failure_reason = 'max runtime exceeded during DRIVE_TO_QR'
                 return 'STOP'
-            # --- 1) Smoothly drive ONE chunk forward (line-follow), obstacle-aware.
-            # Driving FIRST keeps the approach smooth from the start (not stop-go).
-            # NO QR decode while moving: qr_decoder.detect runs a heavy path (~1.8s)
-            # whenever OpenCV finds candidate quads (e.g. the orange floor text),
-            # which STARVES the control loop so the car can't track the line and
-            # drifts off (field 6-14). Decoding happens ONLY at the stationary stop
-            # below, where a slow decode is harmless.
-            chunk_end = time.monotonic() + self.config.drive_chunk_s
-            while (
-                time.monotonic() < chunk_end
-                and time.monotonic() < deadline
-                and rclpy.ok()
-            ):
-                image = self.vision.get_latest(max_age=self.config.image_stale_timeout)
-                if image is None:
+            image = self.vision.get_latest(max_age=self.config.image_stale_timeout)
+            if image is None:
+                self._spin_sleep(interval)
+                continue
+            decision = self._analyze_frame(image)
+            if decision.obstacle_danger and self.config.obstacle_avoid_enabled:
+                self._handle_drive_obstacle(image, decision, interval)
+                lane_lost_frames = 0
+                _sweep_start = None
+                continue
+            cmd = follower.compute(image)
+            if cmd.lane_found:
+                lane_lost_frames = 0
+                _sweep_start = None
+                self.motion.publish(cmd.linear, cmd.angular)
+            else:
+                lane_lost_frames += 1
+                if lane_lost_frames < max(1, self.config.return_line_lost_grace_frames):
+                    self._lane_lost_step(follower, interval)
+                    continue
+                recently_avoided = (
+                    time.monotonic() - self._last_avoid_time
+                    < self.config.recover_after_avoid_s
+                )
+                if recently_avoided:
+                    scmd = search_follower.compute(image)
+                    if scmd.lane_found:
+                        _sweep_start = None
+                        self.motion.publish(self.config.drive_lost_linear, scmd.angular)
+                        _now = time.time()
+                        if _now - _recover_log_t >= 0.5:
+                            print(f'DRIVE_TO_QR_RELINE offset={scmd.offset_norm:.2f}', flush=True)
+                            _recover_log_t = _now
+                        self._spin_sleep(interval)
+                        continue
+                    if _sweep_start is None:
+                        _sweep_start = time.monotonic()
+                    swept_long = (
+                        time.monotonic() - _sweep_start
+                        >= self.config.recover_sweep_max_s
+                    )
+                    if swept_long or abs(self._last_avoid_turn) <= 1e-3:
+                        sweep = 0.0
+                    else:
+                        sweep = -math.copysign(
+                            self.config.drive_lost_angular, self._last_avoid_turn)
+                    self.motion.publish(self.config.drive_lost_linear, sweep)
+                    _now = time.time()
+                    if _now - _recover_log_t >= 0.5:
+                        _dir = 'R' if sweep < 0 else 'L' if sweep > 0 else 'straight'
+                        print(f'DRIVE_TO_QR_SWEEP dir={_dir}', flush=True)
+                        _recover_log_t = _now
                     self._spin_sleep(interval)
                     continue
-                decision = self._analyze_frame(image)
-                if decision.obstacle_danger and self.config.obstacle_avoid_enabled:
-                    self._handle_drive_obstacle(image, decision, interval)
-                    continue
-                if hall_follower is not None:
-                    cmd = hall_follower.compute(image)
-                    if cmd.lane_found:
-                        self.motion.publish(cmd.linear, cmd.angular)
-                    elif decision.obstacle is not None:
-                        # Lane lost AND the obstacle we just dodged is still in view:
-                        # do NOT yaw-recover yet. The anchored heading points straight
-                        # back at it (the cone sat on the line), so turning to it would
-                        # drive into the cone (field 6-17: collided during recovery).
-                        # Creep forward to pass it; recovery waits until it leaves frame.
-                        self.motion.publish(self.config.drive_lost_linear, 0.0)
-                    else:
-                        recently_avoided = (
-                            time.monotonic() - self._last_avoid_time
-                            < self.config.recover_after_avoid_s
-                        )
-                        if not recently_avoided:
-                            _sweep_start = None
-                            self.motion.publish(self.config.drive_lost_linear, 0.0)
-                        else:
-                            scmd = search_follower.compute(image) if search_follower is not None else None
-                            if scmd is not None and scmd.lane_found:
-                                _sweep_start = None
-                                self.motion.publish(self.config.drive_lost_linear, scmd.angular)
-                                _now = time.time()
-                                if _now - _recover_log_t >= 0.5:
-                                    print(f'DRIVE_TO_QR_RELINE offset={scmd.offset_norm:.2f}', flush=True)
-                                    _recover_log_t = _now
-                            else:
-                                if _sweep_start is None:
-                                    _sweep_start = time.monotonic()
-                                swept_long = (
-                                    time.monotonic() - _sweep_start
-                                    >= self.config.recover_sweep_max_s
-                                )
-                                if swept_long or abs(self._last_avoid_turn) <= 1e-3:
-                                    sweep = 0.0
-                                else:
-                                    sweep = -math.copysign(
-                                        self.config.drive_lost_angular, self._last_avoid_turn)
-                                self.motion.publish(self.config.drive_lost_linear, sweep)
-                                _now = time.time()
-                                if _now - _recover_log_t >= 0.5:
-                                    if sweep < 0: _dir = 'R'
-                                    elif sweep > 0: _dir = 'L'
-                                    else: _dir = 'straight'
-                                    print(f'DRIVE_TO_QR_SWEEP dir={_dir}', flush=True)
-                                    _recover_log_t = _now
-                else:
-                    self.motion.publish(self.config.cruise_linear, 0.0)
-                self._spin_sleep(interval)
-            # --- 2) distance ceiling ---
-            if (
-                self.motion_state is not None
-                and self.motion_state.traveled_distance()
-                >= self.config.drive_to_qr_max_distance
-            ):
+                print('DRIVE_TO_QR_LINE_LOST: switching to SCAN_QR', flush=True)
+                self._stop_with_spin()
+                return 'SCAN_QR'
+            if (self.motion_state is not None
+                    and self.motion_state.traveled_distance()
+                    >= self.config.drive_to_qr_max_distance):
                 print(
                     'DRIVE_TO_QR_MAX_DISTANCE '
                     f'dist={self.motion_state.traveled_distance():.2f}m',
@@ -1383,24 +1402,8 @@ class AutoMissionNode(Node):
                 )
                 self._stop_with_spin()
                 return 'SCAN_QR'
-            # --- 3) STOP, settle, decode a CLEAN stationary frame (reliable) ---
-            self.motion.publish(0.0, 0.0)
-            self._spin_sleep(self.config.drive_scan_settle_s)
-            image = self.vision.get_latest(max_age=self.config.image_stale_timeout)
-            if image is not None:
-                qr = self.qr_decoder.detect(
-                    image, time_budget_s=self.config.qr_detect_time_budget_s
-                )
-                if qr.text:
-                    self.qr_content = qr.text
-                    self.qr_method = qr.method
-                    print(f'QR_FOUND_WHILE_STOPPED: {qr.text} method={qr.method}',
-                          flush=True)
-                    self._event('qr_found_while_stopped',
-                                content=qr.text, method=qr.method)
-                    self._stop_with_spin()
-                    return 'SCAN_QR'
-                print('QR_SCAN_CHUNK: no decode yet, creeping forward', flush=True)
+            self._spin_sleep(interval)
+        print('DRIVE_TO_QR_TIMEOUT: switching to SCAN_QR', flush=True)
         self._stop_with_spin()
         return 'SCAN_QR'
 
@@ -1509,7 +1512,7 @@ class AutoMissionNode(Node):
             turn = -self.config.qr_seek_angular if offset > 0 else self.config.qr_seek_angular
             self.motion.publish(self.config.cruise_linear * 0.6, turn)
             self._spin_sleep(1.0 / self.config.rate_hz)
-            return 'SEEKING_QR'
+            return None
         # QR not visible: hand back to the caller (black-line follow / cruise).
         # The line leads to the corridor where the QR board sits, so the timed
         # "seek right" crutch is dropped — it would fight line-following.
@@ -1594,6 +1597,8 @@ class AutoMissionNode(Node):
 
         deadline = time.monotonic() + self.config.scan_qr_timeout
         last_failure_save = 0.0
+        last_qr_text = ''
+        qr_text_count = 0
         while time.monotonic() < deadline and rclpy.ok():
             if not self.guard.runtime_ok():
                 self.failure_reason = 'max runtime exceeded during SCAN_QR'
@@ -1612,7 +1617,25 @@ class AutoMissionNode(Node):
                     print(f'QR_POINTS: {qr.points.reshape(-1, 2).tolist()}', flush=True)
                 if self.args.save_debug_images:
                     self._save_debug_image('qr_success', image)
-                # Anti-jump: only advance once N consistent reads lock direction.
+                # Text consistency counter: escape infinite loop even when
+                # direction is unparsable (e.g. QR content is just "3").
+                if qr.text == last_qr_text:
+                    qr_text_count += 1
+                else:
+                    last_qr_text = qr.text
+                    qr_text_count = 1
+                if qr_text_count >= self.config.qr_confirm_count:
+                    self.qr_content = qr.text
+                    print(f'QR_FINALIZED: {qr.text} after {qr_text_count} consistent reads', flush=True)
+                    self._event('qr_finalized', content=qr.text, reads=qr_text_count)
+                    if self.direction_locked:
+                        pass
+                    elif self._dir_vote and self._dir_vote_count >= 1:
+                        self.direction = self._dir_vote
+                        self.direction_source = 'locked'
+                        self.direction_locked = True
+                        print(f'QR_DIRECTION_FALLBACK: {self._dir_vote}', flush=True)
+                    return 'DECIDE_DIRECTION'
                 if self._confirm_direction(qr.text):
                     return 'DECIDE_DIRECTION'
                 continue
@@ -1661,171 +1684,110 @@ class AutoMissionNode(Node):
             direction=self.direction,
             source=self.direction_source,
         )
-        # Zone A->B: odom/map path for map2d/fixed2d; vision bridge for legacy.
-        if self._map_route_ready() or self._fixed_route_ready():
-            if self.config.qr_align_after_scan_enabled:
-                if not self._align_after_qr_scan():
-                    return 'STOP'
-            # Go through the yellow corridor (map/fixed routes).
-            if self._map_route_ready() and self.route_map.route('QR_TO_CORRIDOR'):
-                result = self._execute_map_route('QR_TO_CORRIDOR')
-                if result == 'STOP':
-                    return 'STOP'
-            elif self._fixed_route_ready() and 'QR_TO_CORRIDOR' in self.config.fixed_routes:
-                result = self._execute_fixed_route('QR_TO_CORRIDOR')
-                if result == 'STOP':
-                    return 'STOP'
+        # Always go through the vision bridge (backup + corridor search).
+        # The map/fixed-route path for QR_TO_CORRIDOR was removed because the
+        # actual waypoints don't match the field layout required for backup.
+        # CORRIDOR_FOLLOW (below) still uses the map/fixed route for the corridor.
+        if self.config.qr_align_after_scan_enabled:
+            if not self._align_after_qr_scan():
+                return 'STOP'
+        if self._bridge_qr_to_corridor():
             self._settle_transition('A_HALL->B_CORRIDOR')
             return 'CORRIDOR_FOLLOW'
         else:
-            # legacy route_mode: pure vision bridge from QR board to corridor mouth.
-            if self._bridge_qr_to_corridor():
-                self._settle_transition('A_HALL->B_CORRIDOR')
-                return 'CORRIDOR_FOLLOW'
-            else:
-                self.failure_reason = 'bridge_qr_to_corridor timeout'
-                return 'STOP'
+            self.failure_reason = 'bridge_qr_to_corridor timeout'
+            return 'STOP'
 
 
     def _bridge_qr_to_corridor(self) -> bool:
-        """Seek the solid yellow corridor mouth after backing away from the QR board.
-
-        Current field reality: after the QR stop there may be no usable black guide
-        line at all. The robot instead has to avoid the yellow-white forbidden grid
-        walls and steer into the solid yellow corridor entrance between them.
-        """
+        """After QR scan: left-turn to parallel forbidden zone, then straight to find black line."""
         if self.args.no_motion:
-            # Dry-run: skip all vision/motion; let the state machine flow through.
             self._event('bridge_qr_corridor_dryrun')
             return True
 
         self._event('bridge_qr_corridor_start', timeout=self.config.bridge_timeout)
         interval = 1.0 / self.config.rate_hz
-        search_dir = -1.0 if self.config.bridge_search_dir == 'right' else 1.0
-
-        # Un-jam from the QR board first so the camera regains a wide enough view
-        # of the corridor entrance area.
-        if self.config.bridge_backup_enabled:
-            self._bridge_backup(None, interval)
-            self._bridge_post_backup_pulse(interval, search_dir)
-
-        phase1_deadline = time.monotonic() + max(0.0, self.config.bridge_phase1_forward_s)
-        while time.monotonic() < phase1_deadline and self.guard.runtime_ok():
-            self.motion.publish(
-                self.config.bridge_align_linear,
-                abs(self.config.bridge_phase1_forward_angular),
-            )
-            self._spin_sleep(interval)
-
-        black_reentry_follower = None
-        black_reentry_hits = 0
-        if self.config.bridge_black_reentry_enabled:
-            black_reentry_follower = LaneFollower(
-                self.vision_detector,
-                'black',
-                self.config.lane_follow_config(
-                    bias=0.0,
-                    side_mode='center',
-                    roi_y_ratio=self.config.bridge_black_reentry_roi_y_ratio,
-                    roi_height_ratio=1.0 - self.config.bridge_black_reentry_roi_y_ratio,
-                ),
-            )
-            black_reentry_follower.reset()
-
-        yellow_seen = False
-
         deadline = time.monotonic() + self.config.bridge_timeout
 
-        while time.monotonic() < deadline and self.guard.runtime_ok():
+        yellow_lower = np.array([20, 80, 80])
+        yellow_upper = np.array([35, 255, 255])
+        black_lower = np.array([0, 0, 0])
+        black_upper = np.array([180, 80, 80])
+
+        ref_edge_x = None
+        ref_saved = False
+        prev_edge_x = None
+        stability_count = 0
+
+        print('BRIDGE_QR: forward+left turn, align to forbidden zone', flush=True)
+
+        while time.monotonic() < deadline and rclpy.ok():
+            if not self.guard.runtime_ok():
+                return False
+
             image = self.vision.get_latest(max_age=self.config.image_stale_timeout)
             if image is None:
                 self._spin_sleep(interval)
                 continue
 
-            # Obstacle check (reuse existing helper).
-            if self.config.obstacle_avoid_enabled:
-                fr = self._analyze_frame(image)
-                if fr.obstacle_danger:
-                    self._handle_drive_obstacle(image, fr, interval)
-                    continue
+            h, w = image.shape[:2]
+            hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+            yellow_mask = cv2.inRange(hsv, yellow_lower, yellow_upper)
 
-            yellow_offset = None
-            if not yellow_seen:
-                yellow_seen, yellow_offset = self._bridge_yellow_seen(image)
-                if yellow_seen:
-                    self._event(
-                        'bridge_yellow_seen',
-                        offset_norm=(round(yellow_offset, 3) if yellow_offset is not None else None),
-                    )
-                    print(
-                        'BRIDGE_YELLOW_SEEN '
-                        f'offset={yellow_offset:+.2f}' if yellow_offset is not None else 'BRIDGE_YELLOW_SEEN',
-                        flush=True,
-                    )
+            right_roi = yellow_mask[int(h*0.5):, int(w*0.6):]
+            edge_x = None
+            for col in range(right_roi.shape[1]):
+                if np.any(right_roi[:, col] > 0):
+                    edge_x = col + int(w * 0.6)
+                    break
+
+            if not ref_saved:
+                if edge_x is not None:
+                    if prev_edge_x is not None and abs(edge_x - prev_edge_x) <= 3:
+                        stability_count += 1
+                    else:
+                        stability_count = 0
+                    prev_edge_x = edge_x
+                    if stability_count >= 5:
+                        ref_edge_x = edge_x
+                        ref_saved = True
+                        if self.args.save_debug_images:
+                            self._save_debug_image('bridge_qr_reference', image)
+                        print(f'BRIDGE_QR_REFERENCE edge_x={edge_x}/{w} ratio={edge_x/w:.2f}', flush=True)
+                        self._event('bridge_qr_reference', edge_x=edge_x, ratio=round(edge_x/w, 3))
+                        continue
+                self.motion.publish(0.1, 0.15)
             else:
-                _, yellow_offset = self._bridge_yellow_seen(image)
-
-            if yellow_seen and black_reentry_follower is not None:
-                black_cmd = black_reentry_follower.compute(image)
-                if black_cmd.lane_found:
-                    black_reentry_hits += 1
-                    if black_reentry_hits >= self.config.bridge_black_reentry_confirm_frames:
-                        self._event(
-                            'bridge_black_reentry_detected',
-                            hits=black_reentry_hits,
-                            mask_area_ratio=round(black_cmd.mask_area_ratio, 4),
-                            offset_norm=round(black_cmd.offset_norm, 3),
-                        )
-                        print(
-                            'BRIDGE_BLACK_REENTRY '
-                            f'hits={black_reentry_hits} '
-                            f'area={black_cmd.mask_area_ratio:.3f} '
-                            f'offset={black_cmd.offset_norm:+.2f}',
-                            flush=True,
-                        )
-                        self._bridge_black_reentry_turn(interval)
-                        return True
+                error = (edge_x - ref_edge_x) if edge_x is not None else 0.0
+                if abs(error) > 15:
+                    correction = error * 0.008
+                    correction = max(-0.12, min(0.12, correction))
                 else:
-                    black_reentry_hits = 0
+                    correction = 0.0
 
-            if yellow_seen:
-                if (
-                    yellow_offset is not None
-                    and abs(yellow_offset - self.config.bridge_yellow_parallel_target_offset)
-                    <= self.config.bridge_yellow_parallel_tol
-                ):
-                    self.motion.publish(
-                        max(
-                            self.config.bridge_turn_linear,
-                            self.config.bridge_black_search_linear,
-                            self.config.cruise_linear,
-                        ),
-                        0.0,
+                black_mask = cv2.inRange(hsv, black_lower, black_upper)
+                center_roi = black_mask[int(h*0.75):, int(w*0.25):int(w*0.75)]
+                black_ratio = np.mean(center_roi > 0) if center_roi.size > 0 else 0.0
+
+                if black_ratio > 0.04:
+                    print(f'BRIDGE_QR_BLACK_LINE ratio={black_ratio:.3f}', flush=True)
+                    self._event('bridge_qr_black_line', ratio=round(black_ratio, 3))
+                    self._stop_with_spin()
+                    print('BRIDGE_QR: turn right 90deg into corridor', flush=True)
+                    self._event('bridge_qr_turn_right')
+                    self._rotate_relative_arc(
+                        -math.radians(90),
+                        math.radians(5),
+                        self.config.shunt_turn_timeout,
                     )
-                else:
-                    turn_sign = 1.0
-                    if yellow_offset is not None:
-                        turn_sign = 1.0 if yellow_offset < self.config.bridge_yellow_parallel_target_offset else -1.0
-                    self.motion.publish(
-                        max(
-                            self.config.bridge_turn_linear,
-                            self.config.bridge_yellow_follow_linear,
-                            self.config.cruise_linear,
-                        ),
-                        turn_sign * abs(self.config.bridge_yellow_follow_angular),
-                    )
-            else:
-                self.motion.publish(
-                    max(
-                        self.config.bridge_turn_linear,
-                        self.config.bridge_yellow_search_linear,
-                        self.config.cruise_linear,
-                    ),
-                    -abs(self.config.bridge_yellow_search_angular),
-                )
+                    self._stop_with_spin()
+                    self._settle_transition('A_HALL->B_CORRIDOR')
+                    return True
+
+                self.motion.publish(0.1, correction)
+
             self._spin_sleep(interval)
 
-        # Timed out.
         self.motion.publish(0.0, 0.0)
         self._event('bridge_qr_corridor_timeout')
         return False
@@ -1892,6 +1854,80 @@ class AutoMissionNode(Node):
         cx = x + bw / 2.0
         offset_norm = (cx - (w / 2.0)) / max(1.0, w / 2.0)
         return True, float(offset_norm)
+
+    def _bridge_entry_reference_mask_for_image(self, image: np.ndarray) -> Optional[np.ndarray]:
+        h, w = image.shape[:2]
+        x0 = int(w * self.config.bridge_entry_reference_roi_x_ratio)
+        y0 = int(h * self.config.bridge_entry_reference_roi_y_ratio)
+        rw = int(w * self.config.bridge_entry_reference_roi_w_ratio)
+        rh = int(h * self.config.bridge_entry_reference_roi_h_ratio)
+        x1 = min(w, x0 + max(1, rw))
+        y1 = min(h, y0 + max(1, rh))
+        if x1 <= x0 or y1 <= y0:
+            return None
+        roi = image[y0:y1, x0:x1]
+        mask, _ = self.vision_detector.color_mask(roi, self.config.green_color, roi_y_ratio=None)
+        small = cv2.resize(mask, (64, 48), interpolation=cv2.INTER_AREA)
+        return (small > 0).astype(np.uint8)
+
+    def _bridge_entry_reference_score(self, image: np.ndarray) -> Optional[float]:
+        if not self._bridge_entry_reference_ready or self._bridge_entry_reference_mask is None:
+            return None
+        current = self._bridge_entry_reference_mask_for_image(image)
+        if current is None:
+            return None
+        ref = self._bridge_entry_reference_mask
+        inter = np.logical_and(ref > 0, current > 0).sum()
+        union = np.logical_or(ref > 0, current > 0).sum()
+        if union <= 0:
+            return 0.0
+        return float(inter) / float(union)
+
+    def _bridge_entry_reference_gate(self, interval: float) -> bool:
+        if not self.config.bridge_entry_reference_enabled or not self._bridge_entry_reference_ready:
+            return True
+        deadline = time.monotonic() + max(0.1, self.config.bridge_entry_reference_timeout)
+        best_score = 0.0
+        while time.monotonic() < deadline and self.guard.runtime_ok():
+            image = self.vision.get_latest(max_age=self.config.image_stale_timeout)
+            if image is None:
+                self._spin_sleep(interval)
+                continue
+            score = self._bridge_entry_reference_score(image)
+            if score is None:
+                self._spin_sleep(interval)
+                continue
+            best_score = max(best_score, score)
+            if score >= self.config.bridge_entry_reference_min_score:
+                print(
+                    'BRIDGE_ENTRY_REFERENCE_MATCH '
+                    f'score={score:.3f}',
+                    flush=True,
+                )
+                self._event(
+                    'bridge_entry_reference_match',
+                    score=round(score, 4),
+                )
+                return True
+            self.motion.publish(
+                max(
+                    self.config.bridge_turn_linear,
+                    self.config.bridge_black_search_linear,
+                    self.config.cruise_linear,
+                ),
+                0.0,
+            )
+            self._spin_sleep(interval)
+        print(
+            'BRIDGE_ENTRY_REFERENCE_TIMEOUT '
+            f'best_score={best_score:.3f}',
+            flush=True,
+        )
+        self._event(
+            'bridge_entry_reference_timeout',
+            best_score=round(best_score, 4),
+        )
+        return True
 
     def _bridge_black_reentry_turn(self, interval: float) -> None:
         angular = -abs(self.config.bridge_black_reentry_turn_angular)
@@ -2302,13 +2338,13 @@ class AutoMissionNode(Node):
             if result == 'STOP':
                 return 'STOP'
             self._stop_with_spin()
-            return 'CAPTURE_TARGET_IMAGE'
+            return 'RETURN_HOME'
         if self._fixed_route_ready() and route_name in self.config.fixed_routes:
             result = self._execute_fixed_route(route_name, capture_markers=True)
             if result == 'STOP':
                 return 'STOP'
             self._stop_with_spin()
-            return 'CAPTURE_TARGET_IMAGE'
+            return 'RETURN_HOME'
         if not self.config.lane_follow_enabled:
             return self._state_loop_timed(direction)
         # Bias hugs the inner edge: ccw (left) ring keeps lane on the right.
@@ -2334,7 +2370,7 @@ class AutoMissionNode(Node):
             duration=self.config.loop_duration,
         )
         self._stop_with_spin()
-        return 'CAPTURE_TARGET_IMAGE'
+        return 'RETURN_HOME'
 
     def _run_ring_follow(self, direction: str, follower) -> str:
         interval = 1.0 / self.config.rate_hz
@@ -2398,7 +2434,7 @@ class AutoMissionNode(Node):
             turned_deg=round(turned_deg, 1), markers=len(self.captured_markers),
         )
         self._stop_with_spin()
-        return 'CAPTURE_TARGET_IMAGE'
+        return 'RETURN_HOME'
 
     def _maybe_capture_marker(self, image, marker_name: Optional[str] = None) -> None:
         """Save an orange-marker crop when one is large enough during the ring."""
@@ -2502,6 +2538,17 @@ class AutoMissionNode(Node):
 
     def _state_call_llm_api(self) -> str:
         self._stop_with_spin()
+        if self.config.llm_mode == 'disabled':
+            self.llm_result = ''
+            print('LLM_SKIPPED: llm_mode=disabled', flush=True)
+            self._event(
+                'llm_result',
+                llm_mode=self.config.llm_mode,
+                result_preview='',
+                published_topic=self.config.llm_result_topic,
+                skipped=True,
+            )
+            return 'RETURN_HOME'
         self.llm_result = self.llm_client.analyze(self.target_image_path)
         print(f'LLM_RESULT: {self.llm_result}', flush=True)
         result_msg = String()
@@ -2516,36 +2563,150 @@ class AutoMissionNode(Node):
         return 'RETURN_HOME'
 
     def _state_return_home(self) -> str:
-        if (
-            self.config.return_mode == 'map2d_fallback'
-            and self.config.map_return_route_enabled
-            and self._map_route_ready()
-            and self.route_map.route('RETURN_TO_P')
-        ):
-            print('RETURN_HOME: map2d RETURN_TO_P with trajectory fallback', flush=True)
-            self._event('return_home_plan', mode='map2d_fallback', route='RETURN_TO_P')
-            result = self._execute_map_route('RETURN_TO_P')
-            if result is None:
+        follower = LaneFollower(
+            self.vision_detector,
+            'black',
+            self.config.lane_follow_config(
+                bias=0.0,
+                side_mode='center',
+            ),
+        )
+        follower.reset()
+        interval = 1.0 / self.config.rate_hz
+        deadline = time.monotonic() + self.config.return_total_timeout
+        print('RETURN_HOME: reacquire black line, then follow home', flush=True)
+        self._event('return_home_plan', mode='black_line_follow_reacquire')
+        if not self._prepare_return_line_follow(follower, interval):
+            self.failure_reason = 'return_home line reacquire timeout'
+            self._stop_with_spin()
+            return 'STOP'
+        lane_lost_frames = 0
+        while time.monotonic() < deadline and rclpy.ok():
+            if not self.guard.runtime_ok():
+                self.failure_reason = 'max runtime exceeded during RETURN_HOME'
+                return 'STOP'
+            image = self.vision.get_latest(max_age=self.config.image_stale_timeout)
+            if image is None:
+                self._spin_sleep(interval)
+                continue
+            cmd = follower.compute(image)
+            if not cmd.lane_found:
+                lane_lost_frames += 1
+                if lane_lost_frames < max(1, self.config.return_line_lost_grace_frames):
+                    self._lane_lost_step(follower, interval)
+                    continue
+                print('RETURN_HOME_LINE_LOST: attempting reacquire', flush=True)
+                self._event(
+                    'return_home_line_lost',
+                    lost_frames=lane_lost_frames,
+                    retry=True,
+                )
+                if self._prepare_return_line_follow(follower, interval):
+                    lane_lost_frames = 0
+                    continue
+                print('RETURN_HOME_DONE reason=line_lost', flush=True)
+                self._event('return_home_done', reason='line_lost')
                 self._stop_with_spin()
                 return 'STOP'
-            print(
-                'RETURN_HOME: map2d failed, falling back to trajectory replay',
-                flush=True,
-            )
-            self._event('return_home_map_fallback', result=result)
-            self.failure_reason = ''
-        if self.config.return_mode in ('map2d_fallback', 'trajectory'):
-            result = self._return_home_trajectory()
-            if result is not None:
-                return result
-        self._timed_motion(
-            label='RETURN_HOME',
-            linear=self.config.return_linear,
-            angular=self.config.return_angular,
-            duration=self.config.return_duration,
-        )
+            lane_lost_frames = 0
+            self.motion.publish(cmd.linear, cmd.angular)
+            self._spin_sleep(interval)
+        print('RETURN_HOME_DONE reason=timeout', flush=True)
+        self._event('return_home_done', reason='timeout')
         self._stop_with_spin()
         return 'STOP'
+
+    def _prepare_return_line_follow(self, follower, interval: float) -> bool:
+        if not self.config.return_reacquire_enabled:
+            return True
+        if self.direction == 'left':
+            search_sign = 1.0
+            target_delta = -math.radians(self.config.return_reacquire_turn_deg)
+        elif self.direction == 'right':
+            search_sign = -1.0
+            target_delta = math.radians(self.config.return_reacquire_turn_deg)
+        else:
+            search_sign = -1.0
+            target_delta = 0.0
+        print(
+            'RETURN_HOME_REACQUIRE '
+            f'direction={self.direction or "unknown"} '
+            f'turn_deg={math.degrees(target_delta):+.1f}',
+            flush=True,
+        )
+        self._event(
+            'return_home_reacquire_start',
+            direction=self.direction or '',
+            turn_deg=round(math.degrees(target_delta), 1),
+        )
+        if abs(target_delta) > 1e-3:
+            self._rotate_relative_arc(
+                target_delta,
+                self.config.return_heading_tol,
+                self.config.shunt_turn_timeout,
+            )
+            self._stop_with_spin()
+        forward_deadline = time.monotonic() + max(0.0, self.config.return_reacquire_forward_s)
+        while time.monotonic() < forward_deadline and rclpy.ok():
+            if not self.guard.runtime_ok():
+                return False
+            self.motion.publish(self.config.return_reacquire_linear, 0.0)
+            self._spin_sleep(interval)
+        target_delta_2 = math.copysign(
+            math.radians(self.config.return_reacquire_turn2_deg),
+            target_delta,
+        ) if abs(target_delta) > 1e-3 else 0.0
+        if abs(target_delta_2) > 1e-3:
+            print(
+                'RETURN_HOME_REACQUIRE_STAGE2 '
+                f'turn_deg={math.degrees(target_delta_2):+.1f}',
+                flush=True,
+            )
+            self._event(
+                'return_home_reacquire_stage2',
+                turn_deg=round(math.degrees(target_delta_2), 1),
+            )
+            self._rotate_relative_arc(
+                target_delta_2,
+                self.config.return_heading_tol,
+                self.config.shunt_turn_timeout,
+            )
+            self._stop_with_spin()
+        forward_deadline_2 = time.monotonic() + max(0.0, self.config.return_reacquire_forward2_s)
+        while time.monotonic() < forward_deadline_2 and rclpy.ok():
+            if not self.guard.runtime_ok():
+                return False
+            self.motion.publish(self.config.return_reacquire_linear, 0.0)
+            self._spin_sleep(interval)
+        deadline = time.monotonic() + max(0.1, self.config.return_reacquire_search_timeout)
+        while time.monotonic() < deadline and rclpy.ok():
+            if not self.guard.runtime_ok():
+                return False
+            image = self.vision.get_latest(max_age=self.config.image_stale_timeout)
+            if image is None:
+                self._spin_sleep(interval)
+                continue
+            cmd = follower.compute(image)
+            if cmd.lane_found:
+                print(
+                    'RETURN_HOME_REACQUIRE_DONE '
+                    f'linear={cmd.linear:.2f} angular={cmd.angular:+.2f}',
+                    flush=True,
+                )
+                self._event(
+                    'return_home_reacquire_done',
+                    linear=round(cmd.linear, 3),
+                    angular=round(cmd.angular, 3),
+                )
+                return True
+            self.motion.publish(
+                self.config.return_reacquire_linear,
+                search_sign * abs(self.config.return_reacquire_angular),
+            )
+            self._spin_sleep(interval)
+        print('RETURN_HOME_REACQUIRE_TIMEOUT', flush=True)
+        self._event('return_home_reacquire_timeout')
+        return False
 
     def _return_home_trajectory(self) -> Optional[str]:
         if self.motion_state is None:
